@@ -1,6 +1,6 @@
 {
   "name": "create-mare-app",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Tauri desktop apps with a Lua backend instead of Rust",
   "type": "module",
   "bin": {
