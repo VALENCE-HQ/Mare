@@ -1,0 +1,30 @@
+{
+  "name": "create-mare-app",
+  "version": "0.3.0",
+  "description": "Tauri desktop apps with a Lua backend instead of Rust",
+  "type": "module",
+  "bin": {
+    "mare": "./index.js",
+    "create-mare-app": "./index.js"
+  },
+  "files": [
+    "index.js",
+    "templates"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@clack/prompts": "^0.10.0"
+  },
+  "keywords": ["tauri", "lua", "scaffold", "create-app", "desktop", "mlua"],
+  "license": "MPL-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/YOUR_USERNAME/mare.git"
+  },
+  "bugs": {
+    "url": "https://github.com/YOUR_USERNAME/mare/issues"
+  },
+  "homepage": "https://github.com/YOUR_USERNAME/mare#readme"
+}

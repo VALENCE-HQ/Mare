@@ -1,0 +1,450 @@
+#!/usr/bin/env node
+import * as p from '@clack/prompts';
+import { spawn, spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const TEMPLATES = path.join(__dirname, 'templates');
+const isWin = process.platform === 'win32';
+const VERSION = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8')).version;
+
+// Optional plugins: name -> Cargo dependency + what it adds to Lua
+const PLUGINS = {
+  dialog: { crate: 'tauri-plugin-dialog', desc: 'File pickers and message boxes' },
+  notification: { crate: 'tauri-plugin-notification', desc: 'System notifications' },
+  opener: { crate: 'tauri-plugin-opener', desc: 'Open links and files in default apps' },
+  clipboard: { crate: 'tauri-plugin-clipboard-manager', desc: 'Read and write the clipboard' },
+  store: { crate: 'tauri-plugin-store', desc: 'Persistent key-value storage' },
+  http: { crate: 'tauri-plugin-http', desc: 'HTTP requests' },
+  'global-shortcut': { crate: 'tauri-plugin-global-shortcut', desc: 'Hotkeys that work in the background' },
+  autostart: { crate: 'tauri-plugin-autostart', desc: 'Launch on login' },
+  updater: { crate: 'tauri-plugin-updater', desc: 'In-app updates (needs signing keys)' },
+  sql: { crate: 'rusqlite', args: ['--features', 'bundled'], desc: 'SQLite databases' },
+};
+const DEFAULT_PLUGINS = ['dialog', 'notification', 'opener'];
+
+// ---- helpers ---------------------------------------------------------------
+
+function run(cmd, args, cwd) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(cmd, args, { cwd, stdio: 'inherit', shell: isWin });
+    child.on('error', reject);
+    child.on('close', (code) =>
+      code === 0
+        ? resolve()
+        : reject(new Error(`"${cmd} ${args.join(' ')}" exited with code ${code}`))
+    );
+  });
+}
+
+function has(cmd) {
+  const r = spawnSync(cmd, ['--version'], { stdio: 'ignore', shell: isWin });
+  return r.status === 0;
+}
+
+function bail(value) {
+  if (p.isCancel(value)) {
+    p.cancel('Cancelled.');
+    process.exit(0);
+  }
+  return value;
+}
+
+function fail(message) {
+  p.log.error(message);
+  process.exit(1);
+}
+
+function requireRust() {
+  if (has('cargo')) return;
+  p.log.error('Rust (cargo) was not found.');
+  p.note(
+    'Install Rust: https://www.rust-lang.org/tools/install\n' +
+      'Tauri prerequisites: https://tauri.app/start/prerequisites/',
+    'Missing requirement'
+  );
+  process.exit(1);
+}
+
+function detectPmFromAgent() {
+  const ua = process.env.npm_config_user_agent || '';
+  for (const pm of ['pnpm', 'yarn', 'bun']) if (ua.startsWith(pm)) return pm;
+  return 'npm';
+}
+
+function detectPmFromProject(dir) {
+  if (fs.existsSync(path.join(dir, 'pnpm-lock.yaml'))) return 'pnpm';
+  if (fs.existsSync(path.join(dir, 'yarn.lock'))) return 'yarn';
+  if (fs.existsSync(path.join(dir, 'bun.lockb')) || fs.existsSync(path.join(dir, 'bun.lock')))
+    return 'bun';
+  return 'npm';
+}
+
+function findProject(start = process.cwd()) {
+  let dir = start;
+  while (true) {
+    if (fs.existsSync(path.join(dir, 'src-tauri', 'tauri.conf.json'))) return dir;
+    const parent = path.dirname(dir);
+    if (parent === dir) return null;
+    dir = parent;
+  }
+}
+
+function requireProject() {
+  const dir = findProject();
+  if (!dir) fail('No Tauri project found here. Run this inside your project folder.');
+  return dir;
+}
+
+function tauriCmd(pm, sub) {
+  return pm === 'npm' ? ['npm', ['run', 'tauri', sub]] : [pm, ['tauri', sub]];
+}
+
+function copyDir(src, dst) {
+  fs.mkdirSync(dst, { recursive: true });
+  for (const e of fs.readdirSync(src, { withFileTypes: true })) {
+    const s = path.join(src, e.name);
+    const d = path.join(dst, e.name);
+    if (e.isDirectory()) copyDir(s, d);
+    else fs.copyFileSync(s, d);
+  }
+}
+
+function parsePluginNames(names) {
+  const out = [];
+  for (const n of names) {
+    if (n === 'all') out.push(...Object.keys(PLUGINS));
+    else if (PLUGINS[n]) out.push(n);
+    else p.log.warn(`Unknown plugin "${n}". Run \`mare plugins\` to see the list.`);
+  }
+  return [...new Set(out)];
+}
+
+// ---- mare.json ---------------------------------------------------------------
+
+const mareJsonPath = (dir) => path.join(dir, 'mare.json');
+
+/** Reads mare.json, creating it from the template if the project doesn't have one yet. */
+function readMareJson(projectDir) {
+  const file = mareJsonPath(projectDir);
+  if (!fs.existsSync(file)) fs.copyFileSync(path.join(TEMPLATES, 'mare.json'), file);
+  return JSON.parse(fs.readFileSync(file, 'utf8'));
+}
+
+function writeMareJson(projectDir, cfg) {
+  fs.writeFileSync(mareJsonPath(projectDir), JSON.stringify(cfg, null, 2) + '\n');
+}
+
+// ---- the setup steps -----------------------------------------------------------
+
+function pluginsMod(enabled) {
+  const mods = enabled.map((n) => n.replace(/-/g, '_'));
+  return `// GENERATED by mare from mare.json. Don't edit.
+#![allow(unused_imports)]
+use mlua::{Lua, Table};
+use tauri::AppHandle;
+
+${mods.map((m) => `pub mod ${m};`).join('\n')}
+
+pub fn install(app: &AppHandle, lua: &Lua, tauri: &Table) -> mlua::Result<()> {
+${mods.map((m) => `    ${m}::install(app, lua, tauri)?;`).join('\n')}
+    Ok(())
+}
+`;
+}
+
+function patchRust(projectDir, enabled) {
+  const tauriDir = path.join(projectDir, 'src-tauri');
+  const srcDir = path.join(tauriDir, 'src');
+  if (!fs.existsSync(path.join(srcDir, 'lib.rs'))) {
+    throw new Error('Could not find src-tauri/src/lib.rs. Is this a Tauri 2 project?');
+  }
+
+  // src/mare/ is fully managed: wipe and rewrite so removed files don't linger
+  const mareDir = path.join(srcDir, 'mare');
+  fs.rmSync(mareDir, { recursive: true, force: true });
+  copyDir(path.join(TEMPLATES, 'rust', 'mare'), mareDir);
+
+  const pluginsDir = path.join(mareDir, 'plugins');
+  fs.mkdirSync(pluginsDir, { recursive: true });
+  for (const name of enabled) {
+    const mod = name.replace(/-/g, '_');
+    fs.copyFileSync(path.join(TEMPLATES, 'rust', 'plugins', `${mod}.rs`), path.join(pluginsDir, `${mod}.rs`));
+  }
+  fs.writeFileSync(path.join(pluginsDir, 'mod.rs'), pluginsMod(enabled));
+
+  fs.copyFileSync(path.join(TEMPLATES, 'rust', 'lib.rs'), path.join(srcDir, 'lib.rs'));
+  return tauriDir;
+}
+
+/** Creates lua/main.lua only if missing, so sync never overwrites your code. */
+function addLua(projectDir) {
+  const luaDir = path.join(projectDir, 'lua');
+  fs.mkdirSync(luaDir, { recursive: true });
+  const main = path.join(luaDir, 'main.lua');
+  if (!fs.existsSync(main)) fs.copyFileSync(path.join(TEMPLATES, 'main.lua'), main);
+}
+
+function addEditorSupport(projectDir) {
+  const typesDir = path.join(projectDir, '.mare', 'types');
+  fs.mkdirSync(typesDir, { recursive: true });
+  fs.copyFileSync(path.join(TEMPLATES, 'types', 'mare.lua'), path.join(typesDir, 'mare.lua'));
+  fs.copyFileSync(path.join(TEMPLATES, 'luarc.json'), path.join(projectDir, '.luarc.json'));
+
+  const extPath = path.join(projectDir, '.vscode', 'extensions.json');
+  let ext = { recommendations: [] };
+  try {
+    if (fs.existsSync(extPath)) ext = JSON.parse(fs.readFileSync(extPath, 'utf8'));
+  } catch {}
+  ext.recommendations = ext.recommendations || [];
+  if (!ext.recommendations.includes('sumneko.lua')) ext.recommendations.push('sumneko.lua');
+  fs.mkdirSync(path.dirname(extPath), { recursive: true });
+  fs.writeFileSync(extPath, JSON.stringify(ext, null, 2) + '\n');
+}
+
+function patchTauriConf(projectDir, enabled) {
+  const confPath = path.join(projectDir, 'src-tauri', 'tauri.conf.json');
+  const conf = JSON.parse(fs.readFileSync(confPath, 'utf8'));
+  conf.bundle = conf.bundle || {};
+
+  const existing = conf.bundle.resources;
+  if (Array.isArray(existing)) {
+    p.log.warn('bundle.resources is already a list. Add this yourself as a map entry: "../lua/": "lua/"');
+  } else {
+    conf.bundle.resources = { ...(existing || {}), '../lua/': 'lua/' };
+  }
+
+  // The updater plugin refuses to start without a config section
+  if (enabled.includes('updater')) {
+    conf.plugins = conf.plugins || {};
+    if (!conf.plugins.updater) {
+      conf.plugins.updater = { pubkey: 'REPLACE_WITH_YOUR_PUBLIC_KEY', endpoints: [] };
+      p.log.warn('Updater: fill in plugins.updater (pubkey, endpoints) in src-tauri/tauri.conf.json.');
+    }
+  }
+  fs.writeFileSync(confPath, JSON.stringify(conf, null, 2) + '\n');
+}
+
+async function addRustDeps(tauriDir, enabled) {
+  await run('cargo', ['add', 'mlua@0.10', '--features', 'lua54,vendored,serialize,async,send'], tauriDir);
+  await run('cargo', ['add', 'tokio', '--features', 'time'], tauriDir);
+  await run('cargo', ['add', 'serde_json'], tauriDir);
+  await run('cargo', ['add', 'tauri', '--features', 'tray-icon'], tauriDir);
+  for (const name of enabled) {
+    const { crate, args = [] } = PLUGINS[name];
+    await run('cargo', ['add', crate, ...args], tauriDir);
+  }
+}
+
+/** Everything Mare needs in a Tauri project. Safe to run repeatedly. */
+async function applyMare(projectDir) {
+  const cfg = readMareJson(projectDir);
+  const enabled = parsePluginNames(cfg.plugins || []);
+
+  p.log.step('Setting up Lua...');
+  const tauriDir = patchRust(projectDir, enabled);
+  addLua(projectDir);
+  addEditorSupport(projectDir);
+  patchTauriConf(projectDir, enabled);
+
+  p.log.step('Adding Rust dependencies...');
+  await addRustDeps(tauriDir, enabled);
+  return enabled;
+}
+
+// ---- commands --------------------------------------------------------------
+
+async function create(nameArg) {
+  p.intro('mare: Tauri apps with a Lua backend');
+  requireRust();
+  if (!has('npx')) fail('npx was not found. Install Node.js from https://nodejs.org');
+
+  const name = bail(
+    await p.text({
+      message: 'Project name',
+      placeholder: 'my-mare-app',
+      initialValue: nameArg || '',
+      validate(v) {
+        if (!v) return 'Please enter a name.';
+        if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]*$/.test(v)) return 'Use letters, numbers, - and _ only.';
+        if (fs.existsSync(path.resolve(process.cwd(), v))) return `"${v}" already exists.`;
+      },
+    })
+  );
+
+  const template = bail(
+    await p.select({
+      message: 'Frontend',
+      options: [
+        { value: 'vanilla', label: 'Vanilla JavaScript' },
+        { value: 'vanilla-ts', label: 'Vanilla TypeScript' },
+        { value: 'react-ts', label: 'React (TypeScript)' },
+        { value: 'vue-ts', label: 'Vue (TypeScript)' },
+        { value: 'svelte-ts', label: 'Svelte (TypeScript)' },
+        { value: 'solid-ts', label: 'Solid (TypeScript)' },
+      ],
+    })
+  );
+
+  const pm = bail(
+    await p.select({
+      message: 'Package manager',
+      initialValue: detectPmFromAgent(),
+      options: ['npm', 'pnpm', 'yarn', 'bun'].map((v) => ({ value: v, label: v })),
+    })
+  );
+
+  const plugins = bail(
+    await p.multiselect({
+      message: 'Plugins (space to toggle, add more later with `mare add`)',
+      options: Object.entries(PLUGINS).map(([value, v]) => ({ value, label: value, hint: v.desc })),
+      initialValues: DEFAULT_PLUGINS,
+      required: false,
+    })
+  );
+
+  const install = bail(
+    await p.confirm({ message: `Install dependencies with ${pm} now?`, initialValue: true })
+  );
+
+  const projectDir = path.resolve(process.cwd(), name);
+
+  try {
+    p.log.step('Creating the Tauri project...');
+    await run(
+      'npx',
+      ['--yes', 'create-tauri-app@latest', name, '--manager', pm, '--template', template, '--yes'],
+      process.cwd()
+    );
+
+    const cfg = readMareJson(projectDir);
+    cfg.plugins = plugins;
+    writeMareJson(projectDir, cfg);
+
+    await applyMare(projectDir);
+
+    if (install) {
+      p.log.step(`Installing dependencies with ${pm}...`);
+      await run(pm, ['install'], projectDir);
+    }
+  } catch (e) {
+    p.log.error(e.message);
+    p.outro('Setup failed. Fix the error above and try again.');
+    process.exit(1);
+  }
+
+  p.note(
+    [
+      `cd ${name}`,
+      install ? null : `${pm} install`,
+      'mare dev',
+      '',
+      'Edit lua/main.lua for your backend, and mare.json for plugins and permissions.',
+      'For autocomplete, install the "Lua" extension (sumneko.lua) in your editor.',
+      'The first build is slow (Rust compiles). Later runs are fast.',
+    ]
+      .filter((l) => l !== null)
+      .join('\n'),
+    'Next steps'
+  );
+  p.outro('Done!');
+}
+
+/** Bring an existing Tauri project (or an older Mare project) up to date. */
+async function sync(title = 'mare sync', done = 'Done! Your lua/ folder was not touched. Run `mare dev` to start.') {
+  p.intro(title);
+  requireRust();
+  const projectDir = requireProject();
+  p.log.info(`Project: ${projectDir}`);
+  try {
+    const enabled = await applyMare(projectDir);
+    p.log.info(`Plugins: ${enabled.length ? enabled.join(', ') : '(none)'}`);
+  } catch (e) {
+    p.log.error(e.message);
+    p.outro('Failed.');
+    process.exit(1);
+  }
+  p.outro(done);
+}
+
+async function addPlugins(names) {
+  const wanted = parsePluginNames(names);
+  if (!wanted.length) fail('Usage: mare add <plugin...|all>   (see `mare plugins`)');
+  const projectDir = requireProject();
+  const cfg = readMareJson(projectDir);
+  cfg.plugins = [...new Set([...(cfg.plugins || []), ...wanted])];
+  writeMareJson(projectDir, cfg);
+  await sync('mare add', `Added: ${wanted.join(', ')}. Restart \`mare dev\`.`);
+}
+
+async function removePlugins(names) {
+  const unwanted = parsePluginNames(names);
+  if (!unwanted.length) fail('Usage: mare remove <plugin...>');
+  const projectDir = requireProject();
+  const cfg = readMareJson(projectDir);
+  cfg.plugins = (cfg.plugins || []).filter((n) => !unwanted.includes(n));
+  writeMareJson(projectDir, cfg);
+  await sync('mare remove', `Removed: ${unwanted.join(', ')}.`);
+
+  // Best effort: drop the now-unused Rust crates
+  const tauriDir = path.join(projectDir, 'src-tauri');
+  for (const n of unwanted) {
+    try {
+      await run('cargo', ['remove', PLUGINS[n].crate], tauriDir);
+    } catch {}
+  }
+}
+
+function listPlugins() {
+  const projectDir = findProject();
+  const enabled = projectDir ? parsePluginNames(readMareJson(projectDir).plugins || []) : [];
+  console.log('\nPlugins (mare add <name>, mare remove <name>, mare add all):\n');
+  for (const [name, v] of Object.entries(PLUGINS)) {
+    console.log(`  ${enabled.includes(name) ? '[x]' : '[ ]'} ${name.padEnd(16)} ${v.desc}`);
+  }
+  console.log();
+}
+
+async function tauriPassthrough(sub) {
+  const projectDir = requireProject();
+  const [cmd, args] = tauriCmd(detectPmFromProject(projectDir), sub);
+  try {
+    await run(cmd, args, projectDir);
+  } catch (e) {
+    p.log.error(e.message);
+    process.exit(1);
+  }
+}
+
+function help() {
+  console.log(`
+mare ${VERSION}: Tauri apps with a Lua backend
+
+Usage
+  mare [name]           Create a new project (same as \`mare create\`)
+  mare sync             Add or update Mare in the current project (safe to re-run)
+  mare add <plugin>     Enable plugins (or \`mare add all\`)
+  mare remove <plugin>  Disable plugins
+  mare plugins          List plugins
+  mare dev              Run the app in development
+  mare build            Build the app for release
+  mare --version        Show the version
+`);
+}
+
+// ---- entry -----------------------------------------------------------------
+
+const [first, ...rest] = process.argv.slice(2);
+
+if (first === '-v' || first === '--version') console.log(VERSION);
+else if (first === '-h' || first === '--help' || first === 'help') help();
+else if (first === 'sync') await sync();
+else if (first === 'add') await addPlugins(rest);
+else if (first === 'remove') await removePlugins(rest);
+else if (first === 'plugins') listPlugins();
+else if (first === 'dev') await tauriPassthrough('dev');
+else if (first === 'build') await tauriPassthrough('build');
+else if (first === 'create') await create(rest[0]);
+else await create(first);
