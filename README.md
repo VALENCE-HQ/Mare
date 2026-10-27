@@ -1,7 +1,7 @@
 <div align=center>
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/Mare.svg">
-  <img width="221" height="243" alt="Mare" src="assets/logo.png" />
+  <source media="(prefers-color-scheme: dark)" srcset="assets/logo.png">
+  <img width="120" height="134" alt="Mare" src="assets/logo.png" />
 </picture>
 
 ---
@@ -120,8 +120,8 @@ Apps you build only use the network if you use it, for example through the `http
 ## Building from source
 
 ```bash
-git clone https://github.com/VALENCE-HQ/Mare
-cd Mare
+git clone https://github.com/YOUR_USERNAME/mare
+cd mare
 npm install
 node index.js help
 ```
@@ -131,7 +131,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) and [docs/HACKING.md](docs/HACKING.md) fo
 
 ## What it changes in your project
 
-`Mare` adds or edits these, and nothing else:
+`mare` adds or edits these, and nothing else:
 
 - `lua/`: your backend (created once, never overwritten)
 - `mare.json`: plugins, permissions and custom protocols (created once)
