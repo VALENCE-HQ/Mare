@@ -14,7 +14,7 @@ Open an issue with:
 ## Working on the code
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/mare
+git clone https://github.com/VALENCE-HQ/Mare
 cd mare
 npm install
 ```

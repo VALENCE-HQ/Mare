@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+
+# Packages and build output (npm pack, releases)
+*.tgz
+dist/
+
+# Logs
+*.log
+npm-debug.log*
+logs/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Editors and OS junk
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Scratch projects made while testing the CLI
+/my-test-app/
+/my-app/
+/test-app/
+/scratch/
+
+# Caches
+coverage/
+.cache/
