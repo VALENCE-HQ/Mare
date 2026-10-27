@@ -166,7 +166,7 @@ At runtime your app writes `app.log` to its log folder (`tauri.log.info(...)` go
 
 ## AI Disclosure
 
-Mare is developed and maintained by (Valence[https://github.com/VALENCE-HQ/]), with AI assistance from Claude (by Anthropic).
+Mare is developed and maintained by (Valence)[https://github.com/VALENCE-HQ/]. with AI assistance from Claude (by Anthropic).
 
 ## License
 
