@@ -1,7 +1,7 @@
 <div align=center>
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/Mare.svg">
-  <img width="120" height="134" alt="Mare" src="assets/logo.png" />
+  <img width="221" height="243" alt="Mare" src="assets/logo.png" />
 </picture>
 
 ---
